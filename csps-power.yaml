@@ -1,0 +1,250 @@
+# CSPS 服务器电源接入 Home Assistant
+#
+# 版本沿革（本配置为第三版）：
+#   第一版：原作者 hitsword/csps_esphome 使用 ESPHome custom platform；
+#   第二版：custom platform 被 ESPHome 移除后，借助第三方仓库
+#           robertklep/esphome-custom-component 恢复 custom 平台继续使用；
+#   第三版（本仓库）：按 ESPHome 文档推荐的方式改写为 external_components
+#           标准外部组件（非 ESPHome 官方发布的项目）。
+#
+# 组件代码位于本目录 my_components/csps。
+# 在 ESPHome 2026.8.2 下验证通过，需配合同目录的 secrets.yaml 使用。
+substitutions:
+  # 电源启动控制引脚（接 KCORES CSPS 转 ATX 转接板），按实际接线修改
+  forced_pin: D4
+  power_pin: D7
+  # 电源 12V 额定输出电流（A），用于计算负载率：
+  #   光宝/Huawei 750W（PS-2751-7H）：62.5
+  #   HP 460W：38.3    华为 300W：25    按实际电源型号修改
+  rated_current: "62.5"
+
+esphome:
+  name: csps-power-supply
+  friendly_name: csps-power-supply
+
+esp8266:
+  board: nodemcuv2
+
+# 启用日志
+logger:
+  # 原配置为 level: NONE，如需排查问题可改为 DEBUG
+  level: INFO
+
+# Home Assistant API
+api:
+  encryption:
+    # API 加密密钥（32 字节 base64）：不要使用任何公开示例值，请自行生成，
+    # 生成方式见 README「快速开始」；实际值写入 secrets.yaml 的 api_encryption_key
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    # OTA 升级密码（32 位十六进制），自行生成后写入 secrets.yaml 的 ota_password
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # 默认使用 DHCP 自动获取 IP；如需固定 IP，取消注释并按实际网络修改：
+  # manual_ip:
+  #   static_ip: 192.168.1.123
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  # WiFi 连接失败时的备用热点
+  ap:
+    ssid: "Csps-Power Fallback"
+    # 备用热点密码（至少 8 位），自行设置后写入 secrets.yaml 的 ap_password
+    password: !secret ap_password
+
+captive_portal:
+
+# 本地网页面板（原配置因老版本 ESPHome 会死机而关闭，现默认开启；
+# 如出现不稳定可整段删除）
+web_server:
+  port: 80
+  # 如需在网页上鉴权，取消注释并往 secrets.yaml 加 web_password:
+  # auth:
+  #   username: admin
+  #   password: !secret web_password
+
+# 指定 i2c 引脚；原 custom 库中为 Wire.setClock(100000)，此处保持 100kHz
+i2c:
+  id: bus_a
+  sda: D2
+  scl: D1
+  frequency: 100kHz
+  scan: true
+
+# 联网对时（供"今日用电"在零点归零），时区决定"一天"的划分
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Asia/Shanghai
+
+# 降低配置写 Flash 的频率，减少 ESP8266 Flash 磨损
+# （影响"今日用电"的断电续记精度：最多丢 10 分钟计数）
+preferences:
+  flash_write_interval: 10min
+
+# 使用 external_components 加载本地组件（ESPHome 文档推荐的自定义硬件方式）
+external_components:
+  - source:
+      type: local
+      path: my_components
+
+# CSPS 电源（PMBus 地址默认 0x5F，信息 ROM 地址默认 0x5F-8=0x57）
+csps:
+  - id: psu
+    update_interval: 1s
+    # 可用选项：
+    # address: 0x5F          # PMBus 地址
+    # rom_address: 0x57      # 信息 ROM 地址
+    # verify_checksum: true  # 校验读回数据的校验和（读失败自动重试）
+
+# 控制主电源启动的引脚（与原配置一致）
+switch:
+  - platform: gpio
+    pin:
+      number: ${forced_pin}
+      inverted: true
+    id: forced_switch
+    name: "Forced Switch"
+    icon: "mdi:power"
+
+  - platform: gpio
+    pin:
+      number: ${power_pin}
+      inverted: true
+    id: power_switch
+    name: "Power Switch"
+    icon: "mdi:power"
+
+# 电源传感器（实体与原配置一致；读数失败时保持上次数值并记录警告）
+sensor:
+  - platform: csps
+    csps_id: psu
+    fan_speed:
+      name: "Fan_Speed"
+    temp1:
+      name: "Temp 1"
+    power_out:
+      name: "Power_Out"
+      id: power_out_w
+    power_in:
+      name: "Power_In"
+      id: power_in_w
+    current_out:
+      name: "Current_Out"
+      id: current_out_a
+    voltage_out:
+      name: "Voltage_Out"
+    voltage_in:
+      name: "Voltage_In"
+    efficiency:
+      name: "Efficiency"
+    # 原版库中已有但未开放的传感器，按需启用：
+    # temp2:
+    #   name: "Temp 2"
+    # current_in:
+    #   name: "Current_In"
+    # output_power:      # 电源直接上报的输出功率（整数 W）
+    #   name: "Output_Power"
+
+  # 负载率 = 输出电流 / 额定电流
+  - platform: template
+    name: "Load_Ratio"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+    state_class: measurement
+    update_interval: 1s
+    lambda: |-
+      float current = id(current_out_a).state;
+      if (isnan(current) || current < 0) {
+        return {};
+      }
+      return current / ${rated_current} * 100.0f;
+
+  # 累计用电量（开机起累计），接入 HA 能源面板时：
+  #   电费请选 "Total_Energy_In"（墙插侧），发电侧可选 "Total_Energy_Out"
+  - platform: integration
+    name: "Total_Energy_Out"
+    sensor: power_out_w
+    time_unit: h
+    integration_method: left
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+    filters:
+      - multiply: 0.001   # W*h -> kWh
+
+  - platform: integration
+    name: "Total_Energy_In"
+    sensor: power_in_w
+    time_unit: h
+    integration_method: left
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+    filters:
+      - multiply: 0.001   # W*h -> kWh
+
+  # 今日用电（每天零点按 Asia/Shanghai 归零）
+  - platform: total_daily_energy
+    name: "Daily_Energy_Out"
+    power_id: power_out_w
+    time_id: sntp_time
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    method: left
+    filters:
+      - multiply: 0.001   # W*h -> kWh
+
+  - platform: total_daily_energy
+    name: "Daily_Energy_In"
+    power_id: power_in_w
+    time_id: sntp_time
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    method: left
+    filters:
+      - multiply: 0.001   # W*h -> kWh
+
+# 风扇转速控制（写入 0x40；PS-2751-7H 实测标定，其他型号按 README 指南重测）
+number:
+  - platform: csps
+    csps_id: psu
+    fan_speed:
+      name: "Fan_Speed_Target"
+      # PS-2751-7H 实测有效范围：3600–17300（实际反馈比设定值略高
+      # 约 100–250 RPM，属电源测速偏差，不影响控制）
+      min_value: 3600
+      max_value: 17300
+      step: 100
+
+# 恢复风扇自动控制（写入 0x40 = 0，已在 PS-2751-7H 实测确认生效）
+button:
+  - platform: csps
+    csps_id: psu
+    fan_auto:
+      name: "Fan_Auto"
+
+# 电源出厂信息（原版仅打印到日志，现可可选地接入 HA）
+text_sensor:
+  - platform: csps
+    csps_id: psu
+    manufacturer:
+      name: "Manufacturer"
+    model_name:
+      name: "Model Name"
+    # 以下按需启用：
+    # spare_part_number:
+    #   name: "Spare Part Number"
+    # manufacture_date:
+    #   name: "Manufacture Date"
+    # option_kit_number:
+    #   name: "Option Kit Number"
+    # ct_date_codes:
+    #   name: "CT Date Codes"
